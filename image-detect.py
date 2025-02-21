@@ -1,33 +1,22 @@
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
+from google.cloud import pubsub_v1
 import cv2
 import torch
 import numpy as np
 import json
 import base64
-from google.cloud import pubsub_v1
-from ultralytics import YOLO
-from torchvision.transforms import Compose, Resize, ToTensor, Normalize
-import logging
+from yolov5 import YOLO  # Ensure you have YOLOv5 installed
 
-logging.getLogger("ultralytics").setLevel(logging.CRITICAL)
-
-# Initialize Google Cloud Pub/Sub
-PROJECT_ID = "cloud-451522"
-SUBSCRIPTION_NAME = "pedestrian-detection-sub"
-
-subscriber = pubsub_v1.SubscriberClient()
-subscription_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_NAME)
-
-# Load YOLO model for pedestrian detection
+# Initialize the models
 yolo_model = YOLO("yolov8n.pt")
 
-# Load MiDaS model for depth estimation
 model_type = "DPT_Large"
 midas = torch.hub.load("intel-isl/MiDaS", model_type)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 midas.to(device)
 midas.eval()
 
-# Load MiDaS transformation
 midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
 transform = midas_transforms.dpt_transform if model_type in ["DPT_Large", "DPT_Hybrid"] else midas_transforms.small_transform
 
@@ -77,21 +66,26 @@ def process_image(image_url):
 
     return json.dumps(results)
 
-def callback(message):
-    """Processes messages from Pub/Sub."""
-    try:
-        image_url = base64.b64decode(message.data).decode("utf-8")
-        print(f"Processing image: {image_url}")
-
+class ProcessImage(beam.DoFn):
+    def process(self, element):
+        image_url = base64.b64decode(element).decode("utf-8")
         result = process_image(image_url)
-        print(f"Result: {result}")
+        yield result
 
-        message.ack()  # Acknowledge message
+def run():
+    PROJECT_ID = "cloud-451522"
+    INPUT_SUBSCRIPTION = "projects/{}/subscriptions/pedestrian-detection-sub".format(PROJECT_ID)
+    OUTPUT_TOPIC = "projects/{}/topics/pedestrian-results".format(PROJECT_ID)
 
-    except Exception as e:
-        print(f"Error processing message: {e}")
-        message.nack()
+    options = PipelineOptions()
+    options.view_as(StandardOptions).streaming = True
 
-# Listen to messages
-subscriber.subscribe(subscription_path, callback=callback)
-print("Listening for messages...")
+    with beam.Pipeline(options=options) as p:
+        (p
+         | "Read from Pub/Sub" >> beam.io.ReadFromPubSub(subscription=INPUT_SUBSCRIPTION)
+         | "Process Image" >> beam.ParDo(ProcessImage())
+         | "Write to Pub/Sub" >> beam.io.WriteToPubSub(OUTPUT_TOPIC)
+        )
+
+if __name__ == "__main__":
+    run()
